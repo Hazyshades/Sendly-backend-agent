@@ -1,0 +1,17 @@
+python-telegram-bot>=21.0
+python-dotenv==1.0.0
+supabase==2.4.6
+gotrue<2.6
+langchain==0.0.352
+openai==0.27.8
+web3==6.15.1
+eth-account==0.10.0
+eth-utils==2.3.1
+requests==2.31.0
+aiohttp==3.9.1
+pydantic==1.10.12
+SQLAlchemy==2.0.41
+circle-developer-controlled-wallets>=8.1.0
+hexbytes>=0.1.0,<0.4.0
+urllib3<2.1.0
+
