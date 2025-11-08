@@ -9,6 +9,8 @@ eth-account==0.10.0
 eth-utils==2.3.1
 requests==2.31.0
 aiohttp==3.9.1
+httpx==0.27.0
+aiofiles==23.2.1
 pydantic==1.10.12
 SQLAlchemy==2.0.41
 circle-developer-controlled-wallets>=8.1.0

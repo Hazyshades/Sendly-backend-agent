@@ -126,3 +126,75 @@ class SupabaseService:
             logger.error(f"Wallet state update error: {e}")
             return False
 
+    async def get_contacts(self, user_id: str) -> List[Dict[str, Any]]:
+        if not self.client:
+            logger.error("Supabase client is not initialized")
+            return []
+
+        try:
+            user_id_lower = user_id.lower()
+
+            response = (
+                self.client.table("voice_contacts")
+                .select("name, wallet_address")
+                .eq("telegram_user_id", user_id_lower)
+                .order("name", desc=False)
+                .execute()
+            )
+
+            if response.data:
+                return response.data
+
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching contacts for user {user_id}: {e}")
+            return []
+
+    async def upsert_contact(self, user_id: str, name: str, wallet: str) -> bool:
+        if not self.client:
+            logger.error("Supabase client is not initialized")
+            return False
+
+        try:
+            if not name.strip() or not wallet.strip():
+                raise ValueError("Name and wallet must be provided")
+
+            data = {
+                "telegram_user_id": user_id.lower(),
+                "name": name.strip(),
+                "wallet_address": wallet.strip(),
+            }
+
+            response = (
+                self.client.table("voice_contacts")
+                .upsert(data, on_conflict="telegram_user_id,name")
+                .execute()
+            )
+
+            return bool(response.data)
+        except Exception as e:
+            logger.error(f"Error upserting contact for user {user_id}: {e}")
+            return False
+
+    async def delete_contact(self, user_id: str, name: str) -> bool:
+        if not self.client:
+            logger.error("Supabase client is not initialized")
+            return False
+
+        try:
+            if not name.strip():
+                raise ValueError("Name must be provided")
+
+            response = (
+                self.client.table("voice_contacts")
+                .delete()
+                .eq("telegram_user_id", user_id.lower())
+                .eq("name", name.strip())
+                .execute()
+            )
+
+            return bool(getattr(response, "count", 0))
+        except Exception as e:
+            logger.error(f"Error deleting contact for user {user_id}: {e}")
+            return False
+

@@ -37,7 +37,23 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
             'response': 'Please send a command to process.'
         }
     
-    system_prompt = """
+    contacts = state.get('contacts', [])
+
+    contacts_prompt = ""
+    if contacts:
+        formatted_contacts = "\n".join(
+            f"{contact['name']}: {contact['wallet_address']}"
+            for contact in contacts
+            if contact.get("name") and contact.get("wallet_address")
+        )
+        if formatted_contacts:
+            contacts_prompt = (
+                "\nKnown contacts (name -> wallet address):\n"
+                f"{formatted_contacts}\n"
+                "If the user refers to a contact by name, map it to the corresponding wallet address."
+            )
+
+    system_prompt = f"""
     You are an assistant for working with crypto wallets using the Circle SDK.
 
     Determine the user's intent from their message and extract the parameters.
@@ -48,7 +64,7 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
     - request_testnet_tokens: request testnet tokens
 
     Return JSON with the fields:
-    {
+    {{
         "operation": "operation_name",
         "blockchain": "ARC-TESTNET",
         "destination_address": "recipient address (if any)",
@@ -57,8 +73,10 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
         "message": "message to sign (if any)",
         "usdc": true/false,
         "eurc": true/false,
-        "native": true/false
-    }
+        "native": true/false,
+        "recipient_name": "contact name if referenced"
+    }}
+    {contacts_prompt}
     """
     
     try:
@@ -83,17 +101,49 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
         else:
             parsed = content
         
+        recipient_name = parsed.get('recipient_name') or parsed.get('recipientName')
+        destination = parsed.get('destination_address')
+
+        if recipient_name and not destination:
+            contact = next(
+                (
+                    contact
+                    for contact in contacts
+                    if contact.get("name", "").lower() == recipient_name.strip().lower()
+                ),
+                None,
+            )
+            if contact:
+                destination = contact.get("wallet_address")
+                parsed["destination_address"] = destination
+            else:
+                logger.warning("Contact not found: %s", recipient_name)
+                return {
+                    'error': f"Contact '{recipient_name}' not found",
+                    'response': (
+                        f"Could not find a contact named {recipient_name}. "
+                        "Add a contact with the command /addcontact Name 0xAddress."
+                    )
+                }
+
         logger.info(f"Recognized operation: {parsed.get('operation')}")
-        
+
+        if parsed.get('operation') == 'send_transaction' and not destination:
+            return {
+                'error': 'Destination address is missing',
+                'response': 'Specify the recipient address or use the /addcontact command to save a contact.'
+            }
+
         return {
             'parsed_command': parsed,
             'operation': parsed.get('operation'),
             'blockchain': parsed.get('blockchain', settings.DEFAULT_BLOCKCHAIN),
-            'destination_address': parsed.get('destination_address'),
+            'destination_address': destination,
             'amount': parsed.get('amount'),
             'token_address': settings.USDC_ADDRESS if parsed.get('token_type') == 'USDC' else settings.EURC_ADDRESS,
             'message': parsed.get('message'),
-            'testnet_tokens_requested': False
+            'testnet_tokens_requested': False,
+            'recipient_name': recipient_name
         }
     
     except Exception as e:
