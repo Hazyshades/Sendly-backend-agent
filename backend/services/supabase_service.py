@@ -1,7 +1,90 @@
-from typing import Optional, List, Dict, Any
-from supabase import create_client, Client
 import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import httpx
+from supabase import create_client, Client
 from models.wallet import DeveloperWallet
+
+
+def build_functions_base_url(supabase_url: str) -> Optional[str]:
+    if not supabase_url:
+        return None
+
+    parsed = urlparse(supabase_url)
+
+    if not parsed.scheme or not parsed.netloc:
+        return None
+
+    host = parsed.netloc
+
+    if ".supabase.co" not in host:
+        return None
+
+    return f"{parsed.scheme}://{host.replace('.supabase.co', '.functions.supabase.co')}"
+
+
+def parse_datetime(value: Optional[Any]) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        normalized = normalized.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    return None
+
+
+def filter_due_schedules(jobs: Optional[List[Dict[str, Any]]], now: datetime) -> List[Dict[str, Any]]:
+    if not jobs:
+        return []
+
+    due: List[Dict[str, Any]] = []
+
+    for job in jobs:
+        if job.get("paused") is True:
+            continue
+
+        status = job.get("status")
+        if status and str(status).lower() != "active":
+            continue
+
+        next_run_at = parse_datetime(job.get("next_run_at"))
+        if not next_run_at or next_run_at > now:
+            continue
+
+        start_at = parse_datetime(job.get("start_at"))
+        if start_at and start_at > now:
+            continue
+
+        end_at = parse_datetime(job.get("end_at"))
+        if end_at and end_at <= now:
+            continue
+
+        max_runs = job.get("max_runs")
+        total_runs = job.get("total_runs") or 0
+        if isinstance(max_runs, int) and total_runs >= max_runs:
+            continue
+
+        due.append(job)
+
+    return due
+
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +95,7 @@ class SupabaseService:
         self.url = url
         self.service_role_key = service_role_key
         self.client: Optional[Client] = None
+        self.functions_base_url: Optional[str] = build_functions_base_url(url)
         self._initialize_client()
     
     def _initialize_client(self):
@@ -242,5 +326,64 @@ class SupabaseService:
             return bool(count)
         except Exception as e:
             logger.error(f"Error deleting contact for user {user_id}: {e}")
+            return False
+
+    async def fetch_due_schedules(
+        self,
+        now: Optional[datetime] = None,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        if not self.client:
+            logger.error("Supabase client is not initialized")
+            return []
+
+        current_time = now or datetime.now(timezone.utc)
+
+        try:
+            response = (
+                self.client.table("scheduled_jobs")
+                .select("*")
+                .lte("next_run_at", current_time.isoformat())
+                .order("next_run_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+
+            return filter_due_schedules(response.data, current_time)
+        except Exception as exc:
+            logger.error("Failed to fetch due schedules: %s", exc)
+            return []
+
+    async def trigger_schedule_run(self, job_id: str) -> bool:
+        if not job_id:
+            logger.error("trigger_schedule_run called without job_id")
+            return False
+
+        if not self.functions_base_url:
+            logger.error("Functions base URL is not configured for SupabaseService")
+            return False
+
+        endpoint = f"{self.functions_base_url}/server/agent/schedules/{job_id}/run"
+        headers = {
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(endpoint, headers=headers, json={})
+
+            if response.status_code >= 400:
+                logger.error(
+                    "Failed to trigger schedule %s: status=%s body=%s",
+                    job_id,
+                    response.status_code,
+                    response.text,
+                )
+                return False
+
+            return True
+        except Exception as exc:
+            logger.error("Error triggering schedule %s: %s", job_id, exc)
             return False
 

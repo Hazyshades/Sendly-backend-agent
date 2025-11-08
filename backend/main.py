@@ -2,7 +2,8 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional
 
 import aiofiles
 from telegram import Update
@@ -20,6 +21,15 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+SCHEDULE_POLL_INTERVAL_SECONDS = max(
+    15,
+    int(os.getenv("SCHEDULE_POLL_INTERVAL_SECONDS", "60"))
+)
+SCHEDULE_RECENT_RUN_TTL_SECONDS = max(
+    15,
+    int(os.getenv("SCHEDULE_RECENT_RUN_TTL_SECONDS", "45"))
+)
+RECENT_SCHEDULE_RUNS: Dict[str, datetime] = {}
 
 agent_graph = None
 
@@ -58,6 +68,61 @@ async def invoke_agent(
 
     result = await agent_graph.ainvoke(initial_state)
     return result
+
+
+def _purge_stale_schedule_runs(now: datetime) -> None:
+    ttl = timedelta(seconds=SCHEDULE_RECENT_RUN_TTL_SECONDS)
+    expired = [
+        job_id
+        for job_id, triggered_at in RECENT_SCHEDULE_RUNS.items()
+        if now - triggered_at > ttl
+    ]
+
+    for job_id in expired:
+        RECENT_SCHEDULE_RUNS.pop(job_id, None)
+
+
+def _should_skip_schedule(job_id: str, now: datetime) -> bool:
+    last_run = RECENT_SCHEDULE_RUNS.get(job_id)
+    if last_run and (now - last_run).total_seconds() < SCHEDULE_RECENT_RUN_TTL_SECONDS:
+        return True
+
+    RECENT_SCHEDULE_RUNS[job_id] = now
+    return False
+
+
+async def _trigger_schedule(job_id: str) -> None:
+    try:
+        success = await supabase_service.trigger_schedule_run(job_id)
+        if not success:
+            logger.error("Failed to trigger scheduled job %s", job_id)
+    except Exception as exc:
+        logger.error("Unexpected error during schedule run %s: %s", job_id, exc)
+
+
+async def schedule_polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(timezone.utc)
+    _purge_stale_schedule_runs(now)
+
+    try:
+        due_jobs = await supabase_service.fetch_due_schedules(now=now)
+    except Exception as exc:
+        logger.error("Failed to fetch due schedules: %s", exc)
+        return
+
+    if not due_jobs:
+        return
+
+    for job in due_jobs:
+        job_id = job.get("id") or job.get("job_id")
+        if not job_id:
+            logger.warning("Skipping schedule without id: %s", job)
+            continue
+
+        if _should_skip_schedule(job_id, now):
+            continue
+
+        context.application.create_task(_trigger_schedule(job_id))
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,6 +361,19 @@ def main():
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     
     application.add_error_handler(error_handler)
+
+    application.job_queue.run_repeating(
+        schedule_polling_job,
+        interval=SCHEDULE_POLL_INTERVAL_SECONDS,
+        first=10.0,
+        name="schedule-poller"
+    )
+
+    logger.info(
+        "Schedule polling enabled: interval=%ss, debounce=%ss",
+        SCHEDULE_POLL_INTERVAL_SECONDS,
+        SCHEDULE_RECENT_RUN_TTL_SECONDS,
+    )
     
     logger.info("Bot started and ready to work!")
     
