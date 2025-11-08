@@ -23,19 +23,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handler for the /start command.
     """
     await update.message.reply_text(
-        "👋 Hi! I'm an AI Agent for working with EOA wallets via the Circle SDK.\n\n"
-        "I can help you:\n"
-        "- Create or retrieve a wallet\n"
+        "👋 Hi! I'm an AI Agent for working with Sendly!\n\n"
         "- Check a balance\n"
         "- Send a transaction\n"
-        "- Sign a message\n"
         "- Request testnet tokens\n\n"
         "Just describe what you want to do in natural language!\n\n"
         "Example commands:\n"
-        "- 'Create a wallet for me on ARC-TESTNET'\n"
         "- 'Check my wallet balance'\n"
         "- 'Send 10 USDC to address 0x...'\n"
-        "- 'Sign the message: Hello World'\n"
         "- 'Request testnet USDC tokens'"
     )
 
@@ -47,15 +42,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 Bot usage guide\n\n"
         "Available operations:\n\n"
-        "1. **Get a wallet**\n"
-        "   'Create a wallet', 'Show my wallet'\n\n"
-        "2. **Check balance**\n"
+        "1. **Check balance**\n"
         "   'Check the balance', 'How many tokens do I have'\n\n"
-        "3. **Send a transaction**\n"
+        "2. **Send a transaction**\n"
         "   'Send 10 USDC to 0x...'\n\n"
-        "4. **Sign a message**\n"
-        "   'Sign the message: message text'\n\n"
-        "5. **Request testnet tokens**\n"
+        "3. **Request testnet tokens**\n"
         "   'Request USDC', 'Give me testnet tokens'\n\n"
         "Just describe what you want to do!"
     )

@@ -43,10 +43,8 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
     Determine the user's intent from their message and extract the parameters.
 
     Possible operations:
-    - get_wallet: retrieve or create a wallet
     - check_balance: check a balance
     - send_transaction: send a transaction
-    - sign_message: sign a message
     - request_testnet_tokens: request testnet tokens
 
     Return JSON with the fields:
@@ -108,7 +106,7 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
 
 async def get_wallet_node(state: AgentState) -> Dict[str, Any]:
     """
-    Retrieve or create a wallet for the user.
+    Retrieve or create a wallet for the user. NOT USED
     """
     logger.info("Node: get_wallet")
     
