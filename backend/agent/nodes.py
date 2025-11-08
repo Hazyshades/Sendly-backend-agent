@@ -23,8 +23,8 @@ if settings.AIMLAPI_API_KEY:
         "aimlapi",
         ChatOpenAI(
             model="gpt-4.1-nano-2025-04-14",  # TODO: change to gpt-4
-            api_key=settings.AIMLAPI_API_KEY,
-            base_url="https://api.aimlapi.com/v1"
+            openai_api_key=settings.AIMLAPI_API_KEY,
+            openai_api_base="https://api.aimlapi.com/v1",
         ),
     ))
 
@@ -33,7 +33,8 @@ if settings.OPENAI_API_KEY:
         "openai",
         ChatOpenAI(
             model="gpt-4o-mini-2024-07-18",
-            api_key=settings.OPENAI_API_KEY,
+            openai_api_key=settings.OPENAI_API_KEY,
+            openai_api_base="https://api.openai.com/v1",
         ),
     ))
 
