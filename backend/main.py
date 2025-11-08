@@ -362,18 +362,25 @@ def main():
     
     application.add_error_handler(error_handler)
 
-    application.job_queue.run_repeating(
-        schedule_polling_job,
-        interval=SCHEDULE_POLL_INTERVAL_SECONDS,
-        first=10.0,
-        name="schedule-poller"
-    )
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(
+            schedule_polling_job,
+            interval=SCHEDULE_POLL_INTERVAL_SECONDS,
+            first=10.0,
+            name="schedule-poller"
+        )
 
-    logger.info(
-        "Schedule polling enabled: interval=%ss, debounce=%ss",
-        SCHEDULE_POLL_INTERVAL_SECONDS,
-        SCHEDULE_RECENT_RUN_TTL_SECONDS,
-    )
+        logger.info(
+            "Schedule polling enabled: interval=%ss, debounce=%ss",
+            SCHEDULE_POLL_INTERVAL_SECONDS,
+            SCHEDULE_RECENT_RUN_TTL_SECONDS,
+        )
+    else:
+        logger.warning(
+            "Job queue unavailable. Install python-telegram-bot with job queue extras "
+            "or disable scheduled tasks."
+        )
     
     logger.info("Bot started and ready to work!")
     

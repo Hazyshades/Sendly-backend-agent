@@ -122,7 +122,8 @@ async def check_wallet_balance(wallet_id: str) -> Dict[str, Any]:
     try:
         balances = await circle_service.get_wallet_balance(
             wallet_id=wallet_id,
-            standard='ERC20'
+            standard=None,
+            include_all=True
         )
         
         if balances is None:

@@ -268,7 +268,8 @@ class CircleService:
     async def get_wallet_balance(
         self,
         wallet_id: str,
-        standard: Optional[str] = "ERC20"
+        standard: Optional[str] = "ERC20",
+        include_all: bool = False
     ) -> Optional[List[Dict[str, Any]]]:
         if not self.wallets_api:
             logger.error("Circle API is not initialized")
@@ -287,6 +288,7 @@ class CircleService:
             balance_response = self.wallets_api.list_wallet_balance(
                 wallet_id,
                 standard=standard_enum,
+                include_all=include_all,
             )
 
             balances = []

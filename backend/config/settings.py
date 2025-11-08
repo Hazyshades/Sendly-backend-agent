@@ -19,6 +19,7 @@ class Settings:
     PINATA_SECRET_KEY: str = os.getenv('PINATA_SECRET_KEY', '')
     
     AIMLAPI_API_KEY: str = os.getenv('AIMLAPI_API_KEY', '')
+    OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY', '')
     
     ELEVENLABS_API_KEY: str = os.getenv('ELEVENLABS_API_KEY', '')
     
@@ -36,13 +37,16 @@ class Settings:
             'CIRCLE_ENTITY_SECRET',
             'SUPABASE_URL',
             'SUPABASE_SERVICE_ROLE_KEY',
-            'AIMLAPI_API_KEY'
         ]
         
         missing_fields = [field for field in required_fields if not getattr(self, field)]
         
         if missing_fields:
             print(f"⚠️ Missing required environment variables: {', '.join(missing_fields)}")
+            return False
+
+        if not (self.AIMLAPI_API_KEY or self.OPENAI_API_KEY):
+            print("⚠️ At least one of AIMLAPI_API_KEY or OPENAI_API_KEY must be set.")
             return False
         
         return True

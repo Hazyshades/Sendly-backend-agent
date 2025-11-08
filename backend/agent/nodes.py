@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.chat_models import ChatOpenAI
 from agent.state import AgentState
@@ -16,11 +16,42 @@ import json
 logger = logging.getLogger(__name__)
 
 
-llm = ChatOpenAI(
-    model="gpt-4.1-nano-2025-04-14", # TODO: change to gpt-4
-    api_key=settings.AIMLAPI_API_KEY,
-    base_url="https://api.aimlapi.com/v1"
-)
+_llm_providers: List[Tuple[str, ChatOpenAI]] = []
+
+if settings.AIMLAPI_API_KEY:
+    _llm_providers.append((
+        "aimlapi",
+        ChatOpenAI(
+            model="gpt-4.1-nano-2025-04-14",  # TODO: change to gpt-4
+            api_key=settings.AIMLAPI_API_KEY,
+            base_url="https://api.aimlapi.com/v1"
+        ),
+    ))
+
+if settings.OPENAI_API_KEY:
+    _llm_providers.append((
+        "openai",
+        ChatOpenAI(
+            model="gpt-4o-mini-2024-07-18",
+            api_key=settings.OPENAI_API_KEY,
+        ),
+    ))
+
+
+async def invoke_llm(messages: List[Any]):
+    if not _llm_providers:
+        raise RuntimeError("No LLM providers configured. Check API keys.")
+
+    last_error: Exception | None = None
+
+    for provider_name, provider in _llm_providers:
+        try:
+            return await provider.ainvoke(messages)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("LLM provider %s failed: %s", provider_name, exc, exc_info=True)
+
+    raise last_error or RuntimeError("All LLM providers failed.")
 
 
 async def parse_command_node(state: AgentState) -> Dict[str, Any]:
@@ -85,7 +116,7 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
             HumanMessage(content=f"User command: {raw_input}")
         ]
         
-        response = await llm.ainvoke(messages)
+        response = await invoke_llm(messages)
         
         content = response.content
         
@@ -122,7 +153,7 @@ async def parse_command_node(state: AgentState) -> Dict[str, Any]:
                     'error': f"Contact '{recipient_name}' not found",
                     'response': (
                         f"Could not find a contact named {recipient_name}. "
-                        "Add a contact with the command /addcontact Name 0xAddress."
+                        "Add a contact with the command /addcontact Name 0xAddress or on the sendly.digital"
                     )
                 }
 
