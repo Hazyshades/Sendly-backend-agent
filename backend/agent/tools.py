@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, List
+import asyncio
 from services.circle_service import CircleService
 from services.supabase_service import SupabaseService
 # from models.wallet import DeveloperWallet
@@ -171,6 +172,15 @@ async def send_transaction(
         
         if not tx_data:
             return {'error': 'Failed to create transaction'}
+
+        if not tx_data.get('txHash'):
+            for attempt in range(3):
+                details = await circle_service.get_transaction(tx_data['id'])
+                if details and details.get('txHash'):
+                    tx_data['txHash'] = details['txHash']
+                    tx_data['state'] = details.get('state', tx_data['state'])
+                    break
+                await asyncio.sleep(1)
         
         return {
             'transaction_id': tx_data['id'],

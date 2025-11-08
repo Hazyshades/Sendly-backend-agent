@@ -264,12 +264,30 @@ async def send_transaction_node(state: AgentState) -> Dict[str, Any]:
             'error': result['error'],
             'response': f"Error while submitting transaction: {result['error']}"
         }
+
+    transaction_hash = result.get('tx_hash')
+    explorer_link = None
+
+    if transaction_hash:
+        explorer_link = f"https://testnet.arcscan.app/tx/{transaction_hash}"
+
+    response_lines = ["Transaction created!"]
+
+    if explorer_link:
+        response_lines.append(f"tx: {explorer_link}")
+
+    response_lines.extend(
+        [
+            f"ID: {result['transaction_id']}",
+            f"Status: {result['state']}",
+        ]
+    )
     
     return {
         'transaction_id': result['transaction_id'],
         'transaction_state': result['state'],
-        'transaction_hash': result.get('tx_hash'),
-        'response': f"Transaction created!\nID: {result['transaction_id']}\nStatus: {result['state']}"
+        'transaction_hash': transaction_hash,
+        'response': "\n".join(response_lines)
     }
 
 

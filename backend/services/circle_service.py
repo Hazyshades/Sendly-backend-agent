@@ -183,15 +183,86 @@ class CircleService:
             if response.data:
                 logger.info("✅ Transaction created: %s", response.data.id)
                 state_value = getattr(response.data.state, "value", response.data.state)
+                tx_hash = self._extract_tx_hash(response.data)
                 return {
                     "id": response.data.id,
                     "state": state_value,
-                    "txHash": None,
+                    "txHash": tx_hash,
                 }
 
             return None
         except Exception as e:
             logger.error("❌ Transaction creation error: %s", e)
+            return None
+
+    @staticmethod
+    def _extract_tx_hash(obj: Any) -> Optional[str]:
+        potential_attributes = [
+            "tx_hash",
+            "txHash",
+            "transaction_hash",
+            "transactionHash",
+            "hash",
+        ]
+
+        for attr in potential_attributes:
+            value = getattr(obj, attr, None)
+            if value:
+                if isinstance(value, dict):
+                    direct_value = value.get("value") or value.get("hash")
+                    if direct_value:
+                        return direct_value
+                if hasattr(value, "value"):
+                    return getattr(value, "value")
+                return str(value)
+
+        if hasattr(obj, "to_dict"):
+            try:
+                data = obj.to_dict()
+                for key in potential_attributes:
+                    if key in data and data[key]:
+                        return str(data[key])
+                for key in ["tx_hash", "txHash"]:
+                    nested = data.get("blockchain_data", {}) if isinstance(data, dict) else {}
+                    if isinstance(nested, dict) and nested.get(key):
+                        return str(nested[key])
+            except Exception:
+                pass
+
+        return None
+
+    async def get_transaction(self, transaction_id: str) -> Optional[Dict[str, Any]]:
+        if not self.transactions_api:
+            logger.error("Circle API is not initialized")
+            return None
+
+        try:
+            if hasattr(self.transactions_api, "get_developer_transaction"):
+                response = self.transactions_api.get_developer_transaction(transaction_id)
+            elif hasattr(self.transactions_api, "get_transaction"):
+                response = self.transactions_api.get_transaction(transaction_id)
+            elif hasattr(self.transactions_api, "get_developer_transactions"):
+                response = self.transactions_api.get_developer_transactions(id=transaction_id, limit=1)
+            else:
+                logger.error("TransactionsApi has no method to fetch a transaction by id")
+                return None
+
+            data = getattr(response, "data", None)
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if not data:
+                return None
+
+            state_value = getattr(data.state, "value", data.state)
+            tx_hash = self._extract_tx_hash(data)
+
+            return {
+                "id": getattr(data, "id", transaction_id),
+                "state": state_value,
+                "txHash": tx_hash,
+            }
+        except Exception as e:
+            logger.error("❌ Transaction fetch error for %s: %s", transaction_id, e)
             return None
 
     async def get_wallet_balance(

@@ -47,6 +47,8 @@ class SupabaseService:
             if response.data:
                 logger.info(f"Wallet found for user: {user_id}")
                 return DeveloperWallet.from_dict(response.data)
+
+            logger.info("Wallet not found for user_id=%s", user_id)
             
             return None
         except Exception as e:
@@ -132,20 +134,40 @@ class SupabaseService:
             return []
 
         try:
-            user_id_lower = user_id.lower()
+            telegram_id_normalized = user_id.lower()
+            contact_user_id = telegram_id_normalized
+
+            wallet = await self.get_wallet_by_user(telegram_id_normalized)
+            if wallet and wallet.user_id:
+                contact_user_id = wallet.user_id.lower()
+            else:
+                logger.info(
+                    "Developer wallet not found for telegram_user_id=%s; falling back to telegram id",
+                    telegram_id_normalized
+                )
 
             response = (
-                self.client.table("voice_contacts")
-                .select("name, wallet_address")
-                .eq("telegram_user_id", user_id_lower)
+                self.client.table("personal_contacts")
+                .select("name, wallet, is_favorite")
+                .eq("user_id", contact_user_id)
+                .order("is_favorite", desc=True)
                 .order("name", desc=False)
                 .execute()
             )
 
-            if response.data:
-                return response.data
+            contacts: List[Dict[str, Any]] = []
 
-            return []
+            for row in response.data or []:
+                wallet_value = row.get("wallet")
+                contact = {
+                    "name": row.get("name"),
+                    "wallet": wallet_value,
+                    "wallet_address": wallet_value,
+                    "is_favorite": row.get("is_favorite", False),
+                }
+                contacts.append(contact)
+
+            return contacts
         except Exception as e:
             logger.error(f"Error fetching contacts for user {user_id}: {e}")
             return []
@@ -159,15 +181,35 @@ class SupabaseService:
             if not name.strip() or not wallet.strip():
                 raise ValueError("Name and wallet must be provided")
 
+            normalized_user_id = user_id.lower()
+            normalized_name = name.strip()
+            normalized_wallet = wallet.strip()
+
+            existing_response = (
+                self.client.table("personal_contacts")
+                .select("is_favorite")
+                .eq("user_id", normalized_user_id)
+                .eq("name", normalized_name)
+                .limit(1)
+                .execute()
+            )
+
+            is_favorite = False
+
+            if existing_response.data:
+                existing_row = existing_response.data[0]
+                is_favorite = existing_row.get("is_favorite", False)
+
             data = {
-                "telegram_user_id": user_id.lower(),
-                "name": name.strip(),
-                "wallet_address": wallet.strip(),
+                "user_id": normalized_user_id,
+                "name": normalized_name,
+                "wallet": normalized_wallet,
+                "is_favorite": is_favorite,
             }
 
             response = (
-                self.client.table("voice_contacts")
-                .upsert(data, on_conflict="telegram_user_id,name")
+                self.client.table("personal_contacts")
+                .upsert(data, on_conflict="user_id,name")
                 .execute()
             )
 
@@ -186,14 +228,18 @@ class SupabaseService:
                 raise ValueError("Name must be provided")
 
             response = (
-                self.client.table("voice_contacts")
+                self.client.table("personal_contacts")
                 .delete()
-                .eq("telegram_user_id", user_id.lower())
+                .eq("user_id", user_id.lower())
                 .eq("name", name.strip())
                 .execute()
             )
 
-            return bool(getattr(response, "count", 0))
+            if response.data:
+                return True
+
+            count = getattr(response, "count", None)
+            return bool(count)
         except Exception as e:
             logger.error(f"Error deleting contact for user {user_id}: {e}")
             return False

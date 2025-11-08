@@ -7,6 +7,7 @@ from typing import Optional
 class DeveloperWallet:
     id: Optional[int] = None
     user_id: str = ''
+    telegram_user_id: Optional[str] = None
     circle_wallet_id: str = ''
     circle_wallet_set_id: Optional[str] = None
     wallet_address: str = ''
@@ -18,8 +19,12 @@ class DeveloperWallet:
     updated_at: Optional[datetime] = None
     
     def to_dict(self) -> dict:
-        return {
-            'telegram_user_id': self.user_id.lower(),
+        normalized_user_id = self.user_id.lower() if self.user_id else None
+        normalized_telegram_id = (
+            self.telegram_user_id.lower() if self.telegram_user_id else None
+        )
+
+        data = {
             'circle_wallet_id': self.circle_wallet_id,
             'circle_wallet_set_id': self.circle_wallet_set_id,
             'wallet_address': self.wallet_address,
@@ -28,12 +33,21 @@ class DeveloperWallet:
             'state': self.state,
             'custody_type': self.custody_type
         }
+
+        if normalized_user_id is not None:
+            data['user_id'] = normalized_user_id
+
+        if normalized_telegram_id is not None:
+            data['telegram_user_id'] = normalized_telegram_id
+
+        return data
     
     @staticmethod
     def from_dict(data: dict) -> 'DeveloperWallet':
         return DeveloperWallet(
             id=data.get('id'),
-            user_id=data.get('telegram_user_id', ''),
+            user_id=data.get('user_id', ''),
+            telegram_user_id=data.get('telegram_user_id'),
             circle_wallet_id=data.get('circle_wallet_id', ''),
             circle_wallet_set_id=data.get('circle_wallet_set_id'),
             wallet_address=data.get('wallet_address', ''),
