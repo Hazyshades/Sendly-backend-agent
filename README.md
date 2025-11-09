@@ -1,12 +1,12 @@
 # Sendly AI Agent
 
-Sendly AI Agent is the backend for a Telegram bot that helps users manage crypto wallets via Circle Developer-Controlled Wallets. The agent understands natural language, supports voice commands, stores contacts in Supabase, and executes wallet operations through a lightweight state-driven flow that does not depend directly on the LangGraph runtime.
+Sendly AI Agent is a universal LangGraph-based agent component that performs functions of controlling user funds and executing flexible money flows via voice or text.
 
 ## Key Features
 
 - Natural language command parsing powered by configurable LLM providers (AIMLAPI or OpenAI) with automatic fallback.
 - Telegram interface that supports both text and voice messages, including ElevenLabs transcription.
-- Wallet operations via the Circle SDK: balance lookup, transaction creation, message signing, and testnet faucet requests.
+- Wallet operations via the Circle SDK.
 - Supabase integration for secure storage of user contacts and scheduled jobs.
 - Periodic polling of Supabase schedules with protection against duplicate triggers.
 - Extensible node-based execution pipeline (`AgentGraph`) that selects the next action based on user state.
@@ -71,6 +71,6 @@ graph TD
 
 - [Circle Developer-Controlled Wallets SDK](https://developers.circle.com/wallets/docs/sdk-overview)
 - [LangGraph Concepts](https://langchain-ai.github.io/langgraph/)
-- [python-telegram-bot Documentation](https://docs.python-telegram-bot.org/en/stable/)
 - [Supabase Documentation](https://supabase.com/docs)
+- [Aimlapi Documentation](https://docs.aimlapi.com)
 
