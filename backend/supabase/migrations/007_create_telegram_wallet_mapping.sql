@@ -57,3 +57,18 @@ COMMENT ON COLUMN telegram_wallet_mapping.code_expires_at IS 'Expiration time fo
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

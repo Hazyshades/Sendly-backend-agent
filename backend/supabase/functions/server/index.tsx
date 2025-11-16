@@ -47,7 +47,10 @@ app.get('/', async (c) => {
       'POST /contacts/save-token',
       'POST /contacts/get-twitch-token',
       'POST /contacts/sync',
-      'POST /wallets/link-telegram'
+      'POST /wallets/link-telegram',
+      'POST /wallets/create-for-social',
+      'GET /wallets/get-by-social',
+      'POST /wallets/send-transaction'
     ]
   });
 });
@@ -201,6 +204,55 @@ async function fetchPrivyUserById(userId: string) {
   }
 
   return { success: false as const, reason: 'not_found' as const };
+}
+
+// Helper function to verify social account ownership through Privy
+async function verifySocialAccount(
+  privyUser: any,
+  platform: string,
+  socialUserId: string
+): Promise<{ verified: boolean; username?: string }> {
+  // Extract linked accounts from Privy user data
+  let linkedAccounts: any[] = [];
+  
+  if (Array.isArray(privyUser.linked_accounts)) {
+    linkedAccounts = privyUser.linked_accounts;
+  } else if (Array.isArray(privyUser.linkedAccounts)) {
+    linkedAccounts = privyUser.linkedAccounts;
+  } else if (Array.isArray(privyUser.accounts)) {
+    linkedAccounts = privyUser.accounts;
+  }
+
+  // Find matching social account
+  const socialAccount = linkedAccounts.find((account: any) => {
+    const type = (account.type || '').toLowerCase();
+    const provider = (account.provider || '').toLowerCase();
+    const providerType = (account.providerType || '').toLowerCase();
+    const subject = account.subject || account.id || account.userId;
+    
+    // Check if platform matches
+    const platformMatch = 
+      type === platform || 
+      type === `${platform}_oauth` ||
+      provider === platform || 
+      provider === `${platform}_oauth` ||
+      providerType === platform ||
+      providerType === `${platform}_oauth`;
+    
+    // Check if social user ID matches
+    const idMatch = subject === socialUserId || String(subject) === String(socialUserId);
+    
+    return platformMatch && idMatch;
+  });
+
+  if (!socialAccount) {
+    return { verified: false };
+  }
+
+  return {
+    verified: true,
+    username: socialAccount.username || socialAccount.name
+  };
 }
 
 function extractPrivyWalletAddresses(userData: any): string[] {
@@ -803,6 +855,30 @@ app.post('/gift-cards/twitter/:tokenId/claim', async (c) => {
     
     await kv.set(`twitter_card:${tokenId}`, mapping);
     
+    // Update Supabase gift_cards table
+    try {
+      const client = getSupabaseClient();
+      const { error: supabaseError } = await client
+        .from('gift_cards')
+        .update({
+          recipient_address: walletAddress.toLowerCase(),
+          recipient_type: 'address',
+          updated_at: new Date().toISOString(),
+          last_synced_at: new Date().toISOString(),
+        })
+        .eq('token_id', tokenId);
+      
+      if (supabaseError) {
+        console.error('Error updating Supabase gift_cards table:', supabaseError);
+        // Don't fail the request if Supabase update fails, but log it
+      } else {
+        console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+      }
+    } catch (supabaseUpdateError) {
+      console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+      // Don't fail the request if Supabase update fails
+    }
+    
     return c.json({ 
       success: true, 
       mapping,
@@ -918,10 +994,16 @@ app.get('/gift-cards/twitch/by-token/:tokenId', async (c) => {
 app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
   try {
     const tokenId = c.req.param('tokenId');
-    const { username, walletAddress } = await c.req.json();
+    const { 
+      username, 
+      walletAddress,      // Optional - if MetaMask is available
+      privyUserId,        // For creating a Developer wallet
+      useDeveloperWallet, // Flag to choose wallet type
+      socialUserId        // Twitch ID for verification
+    } = await c.req.json();
     
-    if (!username || !walletAddress) {
-      return c.json({ error: 'Missing username or wallet address' }, 400);
+    if (!username) {
+      return c.json({ error: 'Missing username' }, 400);
     }
     
     const normalizedUsername = username.toLowerCase().trim();
@@ -940,21 +1022,175 @@ app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
     if (normalizedUsername !== mappingUsername) {
       return c.json({ error: 'Username mismatch. This card is not for your Twitch account' }, 403);
     }
-    
-    mapping.status = 'claimed';
-    mapping.realOwner = walletAddress;
-    mapping.claimedAt = new Date().toISOString();
-    
-    await kv.set(`twitch_card:${tokenId}`, mapping);
-    
-    return c.json({ 
-      success: true, 
-      mapping,
-      message: 'Card claimed successfully. Transfer the NFT to complete the process.'
-    });
+
+    let targetWalletAddress: string;
+    let useCircleAPI = false;
+    let devWallet: any = null;
+
+    // Определить адрес для claim
+    if (useDeveloperWallet || !walletAddress) {
+      // Использовать Developer wallet
+      const client = getSupabaseClient();
+      
+      // Найти или создать Developer wallet
+      let { data: existingWallet } = await client
+        .from('developer_wallets')
+        .select('*')
+        .eq('social_platform', 'twitch')
+        .eq('social_user_id', socialUserId || '')
+        .eq('blockchain', 'ARC-TESTNET')
+        .single();
+
+      if (!existingWallet && privyUserId && socialUserId) {
+        // Создать Developer wallet автоматически
+        const SUPABASE_FUNCTION_URL = Deno.env.get('SUPABASE_FUNCTION_URL') || 
+          `${Deno.env.get('SUPABASE_URL')}/functions/v1/server`;
+        
+        const createResponse = await fetch(`${SUPABASE_FUNCTION_URL}/wallets/create-for-social`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: 'twitch',
+            socialUserId: socialUserId,
+            socialUsername: normalizedUsername,
+            privyUserId: privyUserId,
+            blockchain: 'ARC-TESTNET'
+          })
+        });
+
+        if (!createResponse.ok) {
+          const errorText = await createResponse.text();
+          throw new Error(`Failed to create Developer wallet: ${errorText}`);
+        }
+
+        const createResult = await createResponse.json();
+        existingWallet = createResult.wallet;
+      }
+
+      if (!existingWallet) {
+        return c.json({ 
+          error: 'Developer wallet not found and could not be created',
+          message: 'Please provide walletAddress or ensure privyUserId and socialUserId are provided'
+        }, 400);
+      }
+
+      devWallet = existingWallet;
+      targetWalletAddress = existingWallet.wallet_address;
+      useCircleAPI = true;
+    } else {
+      // Использовать MetaMask кошелек
+      targetWalletAddress = walletAddress;
+      useCircleAPI = false;
+    }
+
+    // Claim the card
+    if (useCircleAPI && devWallet) {
+      // Использовать Circle API для отправки транзакции
+      const TWITCH_VAULT_CONTRACT_ADDRESS = Deno.env.get('VITE_ARC_TWITCH_VAULT_ADDRESS') || 
+        '0xA27E6Cef4e9d794EE0356461fe65437Bb5f7cbE3';
+      
+      const SUPABASE_FUNCTION_URL = Deno.env.get('SUPABASE_FUNCTION_URL') || 
+        `${Deno.env.get('SUPABASE_URL')}/functions/v1/server`;
+      
+      const txResponse = await fetch(`${SUPABASE_FUNCTION_URL}/wallets/send-transaction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          walletId: devWallet.circle_wallet_id,
+          walletAddress: targetWalletAddress,
+          contractAddress: TWITCH_VAULT_CONTRACT_ADDRESS,
+          functionName: 'claimCard',
+          args: [tokenId, normalizedUsername, targetWalletAddress],
+          blockchain: 'ARC-TESTNET',
+          privyUserId: privyUserId,
+          socialPlatform: 'twitch',
+          socialUserId: socialUserId
+        })
+      });
+
+      const txResult = await txResponse.json();
+      if (!txResult.success || !txResult.txHash) {
+        throw new Error(txResult.error || 'Failed to send transaction');
+      }
+
+      // Обновить mapping
+      mapping.status = 'claimed';
+      mapping.realOwner = targetWalletAddress;
+      mapping.claimedAt = new Date().toISOString();
+      await kv.set(`twitch_card:${tokenId}`, mapping);
+
+      // Update Supabase gift_cards table
+      try {
+        const client = getSupabaseClient();
+        const { error: supabaseError } = await client
+          .from('gift_cards')
+          .update({
+            recipient_address: targetWalletAddress.toLowerCase(),
+            recipient_type: 'address',
+            updated_at: new Date().toISOString(),
+            last_synced_at: new Date().toISOString(),
+          })
+          .eq('token_id', tokenId);
+        
+        if (supabaseError) {
+          console.error('Error updating Supabase gift_cards table:', supabaseError);
+        } else {
+          console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+        }
+      } catch (supabaseUpdateError) {
+        console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+      }
+
+      return c.json({
+        success: true,
+        txHash: txResult.txHash,
+        walletAddress: targetWalletAddress,
+        mapping,
+        message: 'Card claimed successfully via Developer wallet'
+      });
+    } else {
+      // Current logic for MetaMask (only update mapping; the transaction is executed on the frontend)
+      mapping.status = 'claimed';
+      mapping.realOwner = targetWalletAddress;
+      mapping.claimedAt = new Date().toISOString();
+      
+      await kv.set(`twitch_card:${tokenId}`, mapping);
+      
+      // Update Supabase gift_cards table
+      try {
+        const client = getSupabaseClient();
+        const { error: supabaseError } = await client
+          .from('gift_cards')
+          .update({
+            recipient_address: targetWalletAddress.toLowerCase(),
+            recipient_type: 'address',
+            updated_at: new Date().toISOString(),
+            last_synced_at: new Date().toISOString(),
+          })
+          .eq('token_id', tokenId);
+        
+        if (supabaseError) {
+          console.error('Error updating Supabase gift_cards table:', supabaseError);
+        } else {
+          console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+        }
+      } catch (supabaseUpdateError) {
+        console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+      }
+      
+      return c.json({ 
+        success: true, 
+        mapping,
+        message: 'Card claimed successfully. Transfer the NFT to complete the process.'
+      });
+    }
   } catch (error) {
     console.log(`Error claiming Twitch card: ${error}`);
-    return c.json({ error: 'Failed to claim Twitch card' }, 500);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ 
+      error: 'Failed to claim Twitch card',
+      details: errorMessage
+    }, 500);
   }
 });
 
@@ -1078,6 +1314,30 @@ app.post('/gift-cards/telegram/:tokenId/claim', async (c) => {
 
     await kv.set(`telegram_card:${tokenId}`, mapping);
 
+    // Update Supabase gift_cards table
+    try {
+      const client = getSupabaseClient();
+      const { error: supabaseError } = await client
+        .from('gift_cards')
+        .update({
+          recipient_address: walletAddress.toLowerCase(),
+          recipient_type: 'address',
+          updated_at: new Date().toISOString(),
+          last_synced_at: new Date().toISOString(),
+        })
+        .eq('token_id', tokenId);
+      
+      if (supabaseError) {
+        console.error('Error updating Supabase gift_cards table:', supabaseError);
+        // Don't fail the request if Supabase update fails, but log it
+      } else {
+        console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+      }
+    } catch (supabaseUpdateError) {
+      console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+      // Don't fail the request if Supabase update fails
+    }
+
     return c.json({
       success: true,
       mapping,
@@ -1086,6 +1346,138 @@ app.post('/gift-cards/telegram/:tokenId/claim', async (c) => {
   } catch (error) {
     console.log(`Error claiming Telegram card: ${error}`);
     return c.json({ error: 'Failed to claim Telegram card' }, 500);
+  }
+});
+
+// TikTok gift card claim endpoint
+app.post('/gift-cards/tiktok/:tokenId/claim', async (c) => {
+  try {
+    const tokenId = c.req.param('tokenId');
+    const { username, walletAddress } = await c.req.json();
+    
+    if (!username || !walletAddress) {
+      return c.json({ error: 'Missing username or wallet address' }, 400);
+    }
+    
+    const normalizedUsername = username.toLowerCase().replace(/^@/, '').trim();
+    const mapping = await kv.get(`tiktok_card:${tokenId}`);
+    
+    if (!mapping) {
+      return c.json({ error: 'TikTok card mapping not found' }, 404);
+    }
+    
+    if (mapping.status !== 'pending') {
+      return c.json({ error: `Card is already ${mapping.status}` }, 400);
+    }
+    
+    const mappingUsername = (mapping.username || '').toLowerCase().replace(/^@/, '').trim();
+    
+    if (normalizedUsername !== mappingUsername) {
+      return c.json({ error: 'Username mismatch. This card is not for your TikTok account' }, 403);
+    }
+    
+    mapping.status = 'claimed';
+    mapping.realOwner = walletAddress;
+    mapping.claimedAt = new Date().toISOString();
+    
+    await kv.set(`tiktok_card:${tokenId}`, mapping);
+    
+    // Update Supabase gift_cards table
+    try {
+      const client = getSupabaseClient();
+      const { error: supabaseError } = await client
+        .from('gift_cards')
+        .update({
+          recipient_address: walletAddress.toLowerCase(),
+          recipient_type: 'address',
+          updated_at: new Date().toISOString(),
+          last_synced_at: new Date().toISOString(),
+        })
+        .eq('token_id', tokenId);
+      
+      if (supabaseError) {
+        console.error('Error updating Supabase gift_cards table:', supabaseError);
+      } else {
+        console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+      }
+    } catch (supabaseUpdateError) {
+      console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+    }
+    
+    return c.json({
+      success: true,
+      mapping,
+      message: 'Card claimed successfully. Transfer the NFT to complete the process.'
+    });
+  } catch (error) {
+    console.log(`Error claiming TikTok card: ${error}`);
+    return c.json({ error: 'Failed to claim TikTok card' }, 500);
+  }
+});
+
+// Instagram gift card claim endpoint
+app.post('/gift-cards/instagram/:tokenId/claim', async (c) => {
+  try {
+    const tokenId = c.req.param('tokenId');
+    const { username, walletAddress } = await c.req.json();
+    
+    if (!username || !walletAddress) {
+      return c.json({ error: 'Missing username or wallet address' }, 400);
+    }
+    
+    const normalizedUsername = username.toLowerCase().replace(/^@/, '').trim();
+    const mapping = await kv.get(`instagram_card:${tokenId}`);
+    
+    if (!mapping) {
+      return c.json({ error: 'Instagram card mapping not found' }, 404);
+    }
+    
+    if (mapping.status !== 'pending') {
+      return c.json({ error: `Card is already ${mapping.status}` }, 400);
+    }
+    
+    const mappingUsername = (mapping.username || '').toLowerCase().replace(/^@/, '').trim();
+    
+    if (normalizedUsername !== mappingUsername) {
+      return c.json({ error: 'Username mismatch. This card is not for your Instagram account' }, 403);
+    }
+    
+    mapping.status = 'claimed';
+    mapping.realOwner = walletAddress;
+    mapping.claimedAt = new Date().toISOString();
+    
+    await kv.set(`instagram_card:${tokenId}`, mapping);
+    
+    // Update Supabase gift_cards table
+    try {
+      const client = getSupabaseClient();
+      const { error: supabaseError } = await client
+        .from('gift_cards')
+        .update({
+          recipient_address: walletAddress.toLowerCase(),
+          recipient_type: 'address',
+          updated_at: new Date().toISOString(),
+          last_synced_at: new Date().toISOString(),
+        })
+        .eq('token_id', tokenId);
+      
+      if (supabaseError) {
+        console.error('Error updating Supabase gift_cards table:', supabaseError);
+      } else {
+        console.log(`Successfully updated Supabase gift_cards table for token ${tokenId}`);
+      }
+    } catch (supabaseUpdateError) {
+      console.error('Exception updating Supabase gift_cards table:', supabaseUpdateError);
+    }
+    
+    return c.json({
+      success: true,
+      mapping,
+      message: 'Card claimed successfully. Transfer the NFT to complete the process.'
+    });
+  } catch (error) {
+    console.log(`Error claiming Instagram card: ${error}`);
+    return c.json({ error: 'Failed to claim Instagram card' }, 500);
   }
 });
 
@@ -2589,7 +2981,10 @@ app.notFound((c) => {
       'GET /contacts/:platform',
       'POST /wallets/create',
       'GET /wallets',
-      'POST /wallets/link-telegram'
+      'POST /wallets/link-telegram',
+      'POST /wallets/create-for-social',
+      'GET /wallets/get-by-social',
+      'POST /wallets/send-transaction'
     ]
   }, 404);
 });
@@ -3252,6 +3647,1187 @@ app.post('/wallets/request-testnet-tokens', async (c) => {
     return c.json({ 
       error: 'Failed to request testnet tokens',
       details: errorMessage 
+    }, 500);
+  }
+});
+
+// TwitchCardVault ABI for contract function calls
+// ABI for all Vault contracts (they all expose the same claimCard function)
+const TwitchCardVaultABI = [
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "tokenId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "string",
+        "name": "username",
+        "type": "string"
+      },
+      {
+        "internalType": "address",
+        "name": "claimer",
+        "type": "address"
+      }
+    ],
+    "name": "claimCard",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+// Twitter and Telegram use the same ABI
+const TwitterCardVaultABI = TwitchCardVaultABI;
+const TelegramCardVaultABI = TwitchCardVaultABI;
+
+// ABI for the main GiftCard contract (create and redeem functions)
+const GiftCardABI = [
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCard",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "tokenId",
+        "type": "uint256"
+      }
+    ],
+    "name": "redeemGiftCard",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_username",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCardForTwitter",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_username",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCardForTwitch",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_username",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCardForTelegram",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_username",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCardForTikTok",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_username",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "_amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "_token",
+        "type": "address"
+      },
+      {
+        "internalType": "string",
+        "name": "_metadataURI",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_message",
+        "type": "string"
+      }
+    ],
+    "name": "createGiftCardForInstagram",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+// Minimal ERC20 ABI (approve only) to support allowance scenarios
+const ERC20_MIN_ABI = [
+  {
+    "inputs": [
+      { "internalType": "address", "name": "spender", "type": "address" },
+      { "internalType": "uint256", "name": "amount", "type": "uint256" }
+    ],
+    "name": "approve",
+    "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+];
+
+// Helper function to get function signature
+function getFunctionSignature(functionName: string, abi: any[]): string {
+  const func = abi.find((item: any) => item.name === functionName && item.type === 'function');
+  if (!func) {
+    throw new Error(`Function ${functionName} not found in ABI`);
+  }
+  
+  const params = func.inputs.map((input: any) => input.type).join(',');
+  return `${functionName}(${params})`;
+}
+
+// Create Developer wallet for social account
+app.post('/wallets/create-for-social', async (c) => {
+  try {
+    const { platform, socialUserId, socialUsername, privyUserId, blockchain = 'ARC-TESTNET' } = await c.req.json();
+    
+    // Validation
+    if (!platform || !socialUserId || !socialUsername || !privyUserId) {
+      return c.json({ error: 'Missing required fields' }, 400);
+    }
+
+    // Platform validation
+    const supportedPlatforms = ['twitch', 'twitter', 'telegram', 'tiktok', 'instagram'];
+    if (!supportedPlatforms.includes(platform)) {
+      return c.json({ 
+        error: 'Unsupported platform',
+        supported: supportedPlatforms
+      }, 400);
+    }
+
+    // Verification via Privy (optional; continue if it fails)
+    let privyUserVerified = false;
+    let privyUser: any = null;
+    
+    try {
+      const privyResult = await fetchPrivyUserById(privyUserId);
+      if (privyResult.success && privyResult.user) {
+        privyUser = privyResult.user;
+        // Check that the social account matches
+        const socialAccount = await verifySocialAccount(privyResult.user, platform, socialUserId);
+        privyUserVerified = socialAccount.verified;
+        
+        if (!privyUserVerified) {
+          console.warn('Social account verification failed; continuing with wallet creation', {
+            platform,
+            socialUserId,
+            privyUserId
+          });
+          // Do not block wallet creation; just log a warning
+        }
+      } else {
+        console.warn('Failed to fetch Privy user; continuing with wallet creation', {
+          privyUserId,
+          reason: privyResult.reason
+        });
+      }
+    } catch (privyError) {
+      console.warn('Error verifying Privy user; continuing with wallet creation:', privyError);
+      // Continue creating the wallet even if Privy verification failed
+    }
+
+    // Check if a wallet already exists
+    const client = getSupabaseClient();
+    const { data: existingWallet } = await client
+      .from('developer_wallets')
+      .select('*')
+      .eq('social_platform', platform)
+      .eq('social_user_id', socialUserId)
+      .eq('blockchain', blockchain)
+      .single();
+
+    if (existingWallet) {
+      return c.json({
+        success: true,
+        wallet: existingWallet,
+        message: 'Wallet already exists'
+      });
+    }
+
+    // Get Circle API credentials
+    const circleApiKey = Deno.env.get('CIRCLE_API_KEY');
+    const circleEntitySecretCiphertext = Deno.env.get('CIRCLE_ENTITY_SECRET_CIPHERTEXT');
+    const circleEntitySecret = Deno.env.get('CIRCLE_ENTITY_SECRET');
+    const circleWalletSetId = Deno.env.get('CIRCLE_WALLET_SET_ID');
+
+    if (!circleApiKey) {
+      return c.json({ 
+        error: 'Circle API credentials not configured',
+        details: 'Please set CIRCLE_API_KEY in Edge Function secrets'
+      }, 500);
+    }
+
+    if (!circleEntitySecretCiphertext && !circleEntitySecret) {
+      return c.json({ 
+        error: 'Circle Entity Secret not configured',
+        details: 'Please set CIRCLE_ENTITY_SECRET_CIPHERTEXT or CIRCLE_ENTITY_SECRET in Edge Function secrets'
+      }, 500);
+    }
+
+    // Helper function to re-encrypt entity secret ciphertext
+    async function reEncryptEntitySecretCiphertext(): Promise<string> {
+      if (!circleEntitySecret) {
+        throw new Error('CIRCLE_ENTITY_SECRET is required for re-encryption');
+      }
+      
+      const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${circleApiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (!publicKeyResponse.ok) {
+        const errorText = await publicKeyResponse.text();
+        throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
+      }
+      
+      const publicKeyData = await publicKeyResponse.json();
+      const entityPublicKey = publicKeyData.data?.publicKey;
+      
+      if (!entityPublicKey) {
+        throw new Error('Failed to get entity public key from response');
+      }
+      
+      const entitySecretBytes = new Uint8Array(
+        circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+      );
+      
+      const keyWithoutHeaders = entityPublicKey
+        .replace(/-----BEGIN PUBLIC KEY-----/g, '')
+        .replace(/-----END PUBLIC KEY-----/g, '')
+        .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
+        .replace(/-----END RSA PUBLIC KEY-----/g, '')
+        .replace(/\s/g, '')
+        .replace(/\n/g, '')
+        .replace(/\r/g, '');
+      
+      const publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
+      
+      const publicKey = await crypto.subtle.importKey(
+        'spki',
+        publicKeyBuffer,
+        {
+          name: 'RSA-OAEP',
+          hash: 'SHA-256',
+        },
+        false,
+        ['encrypt']
+      );
+      
+      const encrypted = await crypto.subtle.encrypt(
+        {
+          name: 'RSA-OAEP',
+        },
+        publicKey,
+        entitySecretBytes
+      );
+      
+      return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
+    }
+
+    // Ensure CIRCLE_ENTITY_SECRET is present (required for re-encryption)
+    if (!circleEntitySecret) {
+      return c.json({ 
+        error: 'Circle Entity Secret required',
+        details: 'CIRCLE_ENTITY_SECRET must be set in Edge Function secrets to re-encrypt entity secret ciphertext for each request. Circle API does not allow reusing old ciphertext.'
+      }, 500);
+    }
+
+    // Create wallet set if needed
+    let walletSetId = circleWalletSetId;
+    
+    if (!walletSetId) {
+      const idempotencyKey = crypto.randomUUID();
+      
+      // Re-encrypt for wallet set creation
+      let entitySecretCiphertextForWalletSet: string;
+      try {
+        entitySecretCiphertextForWalletSet = await reEncryptEntitySecretCiphertext();
+        console.log('Successfully re-encrypted entity secret ciphertext for wallet set');
+      } catch (reEncryptError) {
+        console.error('Failed to re-encrypt entity secret for wallet set:', reEncryptError);
+        return c.json({ 
+          error: 'Failed to generate entity secret ciphertext for wallet set',
+          details: 'Unable to re-encrypt entity secret for wallet set creation'
+        }, 500);
+      }
+      
+      const walletSetResponse = await fetch('https://api.circle.com/v1/w3s/developer/walletSets', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${circleApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: `Wallet Set for ${platform}:${socialUserId}`,
+          idempotencyKey: idempotencyKey,
+          entitySecretCiphertext: entitySecretCiphertextForWalletSet
+        })
+      });
+
+      if (!walletSetResponse.ok) {
+        const errorText = await walletSetResponse.text();
+        throw new Error(`Failed to create wallet set: ${walletSetResponse.status} ${errorText}`);
+      }
+
+      const walletSetData = await walletSetResponse.json();
+      walletSetId = walletSetData.data?.walletSet?.id;
+      
+      if (!walletSetId) {
+        throw new Error('Failed to get wallet set ID from response');
+      }
+    }
+
+    // Create wallet
+    const walletIdempotencyKey = crypto.randomUUID();
+    
+    // Re-encrypt for wallet creation (fresh ciphertext required for every request)
+    let entitySecretCiphertextForWalletCreation: string;
+    try {
+      entitySecretCiphertextForWalletCreation = await reEncryptEntitySecretCiphertext();
+      console.log('Successfully re-encrypted entity secret ciphertext for wallet creation');
+    } catch (reEncryptError) {
+      console.error('Failed to re-encrypt entity secret for wallet creation:', reEncryptError);
+      return c.json({ 
+        error: 'Failed to generate entity secret ciphertext for wallet creation',
+        details: 'Unable to re-encrypt entity secret. Circle API requires fresh ciphertext for each request.'
+      }, 500);
+    }
+    
+    const requestHeaders: Record<string, string> = {
+      'Authorization': `Bearer ${circleApiKey}`,
+      'Content-Type': 'application/json',
+      'X-Entity-Secret-Ciphertext': entitySecretCiphertextForWalletCreation,
+    };
+
+    const requestBody = {
+      blockchains: [blockchain],
+      count: 1,
+      walletSetId: walletSetId,
+      accountType: 'EOA',
+      idempotencyKey: walletIdempotencyKey,
+      entitySecretCiphertext: entitySecretCiphertextForWalletCreation,
+      metadata: [{
+        name: `Wallet for ${platform}:${socialUsername}`,
+        refId: `social:${platform}:${socialUserId}`
+      }]
+    };
+
+    const createWalletResponse = await fetch('https://api.circle.com/v1/w3s/developer/wallets', {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!createWalletResponse.ok) {
+      const errorText = await createWalletResponse.text();
+      console.error('Circle API error:', errorText);
+      throw new Error(`Failed to create wallet: ${createWalletResponse.status} ${errorText}`);
+    }
+
+    const walletData = await createWalletResponse.json();
+    const createdWallet = walletData.data?.wallets?.[0];
+
+    if (!createdWallet) {
+      throw new Error('No wallet returned from Circle API');
+    }
+
+    // Save to DB
+    const { data: newWallet, error: dbError } = await client
+      .from('developer_wallets')
+      .insert({
+        user_id: `social:${platform}:${socialUserId}`,
+        user_type: `${platform}_id`,
+        social_platform: platform,
+        social_user_id: socialUserId,
+        social_username: socialUsername,
+        privy_user_id: privyUserId,
+        circle_wallet_id: createdWallet.id,
+        circle_wallet_set_id: walletSetId,
+        wallet_address: createdWallet.address,
+        blockchain: blockchain,
+        account_type: 'EOA',
+        state: createdWallet.state || 'LIVE',
+        custody_type: 'DEVELOPER'
+      })
+      .select()
+      .single();
+
+    if (dbError) {
+      console.error('Database error:', dbError);
+      throw new Error(`Failed to save wallet to database: ${dbError.message}`);
+    }
+
+    return c.json({
+      success: true,
+      wallet: newWallet
+    });
+  } catch (error) {
+    console.error('Error creating social wallet:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ 
+      error: 'Failed to create wallet',
+      details: errorMessage
+    }, 500);
+  }
+});
+
+// Get wallet by social account
+app.get('/wallets/get-by-social', async (c) => {
+  try {
+    const platform = c.req.query('platform');
+    const socialUserId = c.req.query('socialUserId');
+    const blockchain = c.req.query('blockchain') || 'ARC-TESTNET';
+    
+    if (!platform || !socialUserId) {
+      return c.json({ error: 'Missing required parameters: platform, socialUserId' }, 400);
+    }
+
+    const client = getSupabaseClient();
+    const { data: wallet, error } = await client
+      .from('developer_wallets')
+      .select('*')
+      .eq('social_platform', platform)
+      .eq('social_user_id', socialUserId)
+      .eq('blockchain', blockchain)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = not found
+      throw new Error(`Failed to fetch wallet: ${error.message}`);
+    }
+
+    return c.json({
+      success: true,
+      wallet: wallet || null
+    });
+  } catch (error) {
+    console.error('Error fetching wallet by social:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ 
+      error: 'Failed to fetch wallet',
+      details: errorMessage 
+    }, 500);
+  }
+});
+
+// Send transaction via Developer wallet (CRITICAL)
+app.post('/wallets/send-transaction', async (c) => {
+  try {
+    const { 
+      walletId, 
+      walletAddress, 
+      contractAddress, 
+      functionName, 
+      args, 
+      blockchain,
+      privyUserId,
+      socialPlatform,
+      socialUserId
+    } = await c.req.json();
+
+    if (!walletId || !walletAddress || !contractAddress || !functionName || !args || !blockchain) {
+      return c.json({ 
+        error: 'Missing required fields',
+        required: ['walletId', 'walletAddress', 'contractAddress', 'functionName', 'args', 'blockchain']
+      }, 400);
+    }
+
+    // Verify wallet ownership
+    const client = getSupabaseClient();
+    const { data: wallet } = await client
+      .from('developer_wallets')
+      .select('*')
+      .eq('circle_wallet_id', walletId)
+      .eq('wallet_address', walletAddress.toLowerCase())
+      .single();
+
+    if (!wallet) {
+      console.error('Wallet not found in database', { walletId, walletAddress });
+      return c.json({ error: 'Wallet not found' }, 404);
+    }
+
+    console.log('Wallet found:', {
+      walletId: wallet.circle_wallet_id,
+      walletAddress: wallet.wallet_address,
+      blockchain: wallet.blockchain,
+      state: wallet.state
+    });
+
+    // Verify via social account
+    if (socialPlatform && socialUserId) {
+      if (wallet.social_platform !== socialPlatform || 
+          wallet.social_user_id !== socialUserId) {
+        return c.json({ error: 'Wallet ownership verification failed' }, 403);
+      }
+    }
+
+    // Verify via Privy
+    if (privyUserId && wallet.privy_user_id !== privyUserId) {
+      return c.json({ error: 'Privy user verification failed' }, 403);
+    }
+
+    // Get Circle API credentials
+    const circleApiKey = Deno.env.get('CIRCLE_API_KEY');
+    const circleEntitySecretCiphertext = Deno.env.get('CIRCLE_ENTITY_SECRET_CIPHERTEXT');
+    const circleEntitySecret = Deno.env.get('CIRCLE_ENTITY_SECRET');
+
+    if (!circleApiKey) {
+      return c.json({ 
+        error: 'Circle API credentials not configured',
+        details: 'Please set CIRCLE_API_KEY in Edge Function secrets'
+      }, 500);
+    }
+
+    if (!circleEntitySecretCiphertext && !circleEntitySecret) {
+      return c.json({ 
+        error: 'Circle Entity Secret not configured',
+        details: 'Please set CIRCLE_ENTITY_SECRET_CIPHERTEXT or CIRCLE_ENTITY_SECRET in Edge Function secrets'
+      }, 500);
+    }
+
+    console.log('Circle API credentials check:', {
+      hasApiKey: !!circleApiKey,
+      hasEntitySecretCiphertext: !!circleEntitySecretCiphertext,
+      hasEntitySecret: !!circleEntitySecret,
+      walletId: walletId,
+      walletAddress: walletAddress,
+      contractAddress: contractAddress,
+      functionName: functionName,
+      blockchain: blockchain
+    });
+
+    // Helper function to re-encrypt entity secret ciphertext
+    async function reEncryptEntitySecretCiphertext(): Promise<string> {
+      if (!circleEntitySecret) {
+        throw new Error('CIRCLE_ENTITY_SECRET is required for re-encryption');
+      }
+      
+      const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${circleApiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (!publicKeyResponse.ok) {
+        const errorText = await publicKeyResponse.text();
+        throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
+      }
+      
+      const publicKeyData = await publicKeyResponse.json();
+      const entityPublicKey = publicKeyData.data?.publicKey;
+      
+      if (!entityPublicKey) {
+        throw new Error('Failed to get entity public key from response');
+      }
+      
+      const entitySecretBytes = new Uint8Array(
+        circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+      );
+      
+      const keyWithoutHeaders = entityPublicKey
+        .replace(/-----BEGIN PUBLIC KEY-----/g, '')
+        .replace(/-----END PUBLIC KEY-----/g, '')
+        .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
+        .replace(/-----END RSA PUBLIC KEY-----/g, '')
+        .replace(/\s/g, '')
+        .replace(/\n/g, '')
+        .replace(/\r/g, '');
+      
+      const publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
+      
+      const publicKey = await crypto.subtle.importKey(
+        'spki',
+        publicKeyBuffer,
+        {
+          name: 'RSA-OAEP',
+          hash: 'SHA-256',
+        },
+        false,
+        ['encrypt']
+      );
+      
+      const encrypted = await crypto.subtle.encrypt(
+        {
+          name: 'RSA-OAEP',
+        },
+        publicKey,
+        entitySecretBytes
+      );
+      
+      return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
+    }
+
+    // Re-encrypt Entity Secret Ciphertext
+    let entitySecretCiphertextForRequest: string;
+    
+    if (circleEntitySecret) {
+      try {
+        entitySecretCiphertextForRequest = await reEncryptEntitySecretCiphertext();
+      } catch (reEncryptError) {
+        console.warn('Failed to re-encrypt entity secret:', reEncryptError);
+        if (circleEntitySecretCiphertext) {
+          entitySecretCiphertextForRequest = circleEntitySecretCiphertext;
+        } else {
+          return c.json({ 
+            error: 'Failed to generate entity secret ciphertext',
+            details: 'Unable to re-encrypt entity secret'
+          }, 500);
+        }
+      }
+    } else if (circleEntitySecretCiphertext) {
+      entitySecretCiphertextForRequest = circleEntitySecretCiphertext;
+    } else {
+      return c.json({ 
+        error: 'Circle Entity Secret or Ciphertext required',
+        details: 'Either CIRCLE_ENTITY_SECRET or CIRCLE_ENTITY_SECRET_CIPHERTEXT must be set'
+      }, 500);
+    }
+
+    // Проверка, что entitySecretCiphertextForRequest не пустой
+    if (!entitySecretCiphertextForRequest || entitySecretCiphertextForRequest.trim() === '') {
+      return c.json({ 
+        error: 'Entity Secret Ciphertext is empty',
+        details: 'Failed to generate or retrieve entity secret ciphertext. Please check CIRCLE_ENTITY_SECRET and CIRCLE_ENTITY_SECRET_CIPHERTEXT configuration.'
+      }, 500);
+    }
+
+    console.log('Entity Secret Ciphertext prepared:', {
+      hasCiphertext: !!entitySecretCiphertextForRequest,
+      length: entitySecretCiphertextForRequest.length,
+      preview: `${entitySecretCiphertextForRequest.substring(0, 20)}...`
+    });
+
+    // Choose the correct ABI based on contractAddress, functionName or socialPlatform
+    let abiToUse: any[] = TwitchCardVaultABI; // Default
+    const contractAddressLower = contractAddress.toLowerCase();
+    
+    // Card creation functions are in the main GiftCard contract, not in Vault contracts
+    const isCreateFunction = functionName.startsWith('createGiftCard');
+    const isErc20Approve = functionName === 'approve';
+    // Main GiftCard contract addresses
+    const mainContractAddresses: string[] = [
+      Deno.env.get('VITE_ARC_CONTRACT_ADDRESS'),
+      Deno.env.get('VITE_CONTRACT_ADDRESS'),
+      '0x5743fd9c6372bE37B2CE8884EA9e8bF291132677', // Current address from logs
+      '0x7f5c9e8548002134cde6093f2ca3ff5b8bd26982' // Fallback адрес
+    ].filter((addr): addr is string => Boolean(addr)).map(addr => addr.toLowerCase());
+    const isMainContract = mainContractAddresses.some(addr => contractAddressLower === addr);
+    
+    if (isErc20Approve) {
+      // Use the minimal ERC20 ABI for approve
+      abiToUse = ERC20_MIN_ABI;
+    } else if (isCreateFunction || isMainContract) {
+      // Use the main contract ABI for card creation functions
+      abiToUse = GiftCardABI;
+    } else {
+      // Determine the Vault contract ABI by contract address or platform
+      if (socialPlatform === 'twitter' || contractAddressLower.includes('twitter') || 
+          contractAddressLower === '0xf8a0870530bb7cd1d658742a079f85e91dfc8e3c') {
+        abiToUse = TwitterCardVaultABI;
+      } else if (socialPlatform === 'telegram' || contractAddressLower.includes('telegram') ||
+                 contractAddressLower === '0x619a49213860a0448736880c4f456bcdfb96d938') {
+        abiToUse = TelegramCardVaultABI;
+      } else if (socialPlatform === 'twitch' || contractAddressLower.includes('twitch') ||
+                 contractAddressLower === '0xa27e6cef4e9d794ee0356461fe65437bb5f7cbe3') {
+        abiToUse = TwitchCardVaultABI;
+      }
+    }
+    
+    // Prepare the transaction for the Circle API
+    const functionSignature = getFunctionSignature(functionName, abiToUse);
+    
+    // Transform args for the Circle API
+    // Args can be: BigInt, string (numbers), string (addresses)
+    const formattedArgs = args.map((arg: any) => {
+      // Convert BigInt to string
+      if (typeof arg === 'bigint') {
+        return arg.toString();
+      }
+      // If it is a numeric string (e.g., tokenId) - keep as string
+      if (typeof arg === 'string') {
+        // Address - keep as is
+        if (arg.startsWith('0x')) {
+          return arg;
+        }
+        // Numeric string - keep as is (Circle API accepts strings for big integers)
+        // Check if it is numeric
+        if (!isNaN(Number(arg)) && arg.trim() !== '') {
+          return arg; // Keep as string for big integers
+        }
+        // Regular string (e.g., username) - keep as is
+        return arg;
+      }
+      // Number - convert to string for large values
+      if (typeof arg === 'number') {
+        return arg.toString();
+      }
+      return arg;
+    });
+
+    // Circle API expects a flat fee field (not nested)
+    // As per REST API docs, feeLevel must be on the top-level request body
+    // https://developers.circle.com/api-reference/w3s/developer-controlled-wallets/create-contract-execution-transaction
+    const transactionData = {
+      walletId: walletId as string,
+      contractAddress: contractAddress as string,
+      abiFunctionSignature: functionSignature as string,
+      abiParameters: formattedArgs,
+      feeLevel: 'MEDIUM' as const,
+      entitySecretCiphertext: entitySecretCiphertextForRequest,
+      idempotencyKey: crypto.randomUUID()
+    };
+
+    console.log('Sending transaction to Circle API:', {
+      walletId: transactionData.walletId,
+      contractAddress: transactionData.contractAddress,
+      abiFunctionSignature: transactionData.abiFunctionSignature,
+      abiParameters: transactionData.abiParameters,
+      feeLevel: transactionData.feeLevel,
+      blockchain: blockchain
+    });
+
+    // Optional wallet check in Circle (may not work if the wallet belongs to a different entity)
+    // If the wallet exists in DB and is LIVE, try sending the transaction directly.
+    // Circle API will error on creation if the wallet does not belong to the entity.
+    let walletVerifiedInCircle = false;
+    try {
+      const walletCheckResponse = await fetch(`https://api.circle.com/v1/w3s/developer/wallets/${walletId}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${circleApiKey}`,
+          'Content-Type': 'application/json',
+          'X-Entity-Secret-Ciphertext': entitySecretCiphertextForRequest
+        }
+      });
+
+      if (walletCheckResponse.ok) {
+        const walletData = await walletCheckResponse.json();
+        console.log('Wallet verified in Circle:', {
+          walletId: walletData.data?.wallet?.id,
+          state: walletData.data?.wallet?.state,
+          address: walletData.data?.wallet?.address,
+          blockchain: walletData.data?.wallet?.blockchain
+        });
+        walletVerifiedInCircle = true;
+
+        // Ensure the wallet is in the correct state
+        if (walletData.data?.wallet?.state !== 'LIVE') {
+          console.warn('Wallet is not in LIVE state:', walletData.data?.wallet?.state);
+        }
+      } else {
+        // Wallet not found in Circle; this can be normal if it belongs to a different entity.
+        // Continue and attempt to send the transaction — Circle will error if the wallet is not owned by the entity.
+        const errorText = await walletCheckResponse.text();
+        console.warn('Wallet check returned non-OK status (this may be normal if wallet belongs to different entity):', {
+          status: walletCheckResponse.status,
+          statusText: walletCheckResponse.statusText,
+          error: errorText,
+          walletId: walletId,
+          note: 'Will attempt to send the transaction anyway — Circle API will return an error if wallet does not belong to the entity'
+        });
+      }
+    } catch (walletCheckError) {
+      // Error during wallet check — continue and attempt to send the transaction
+      console.warn('Error checking wallet in Circle (will attempt the transaction anyway):', walletCheckError);
+    }
+
+    // Send the transaction via the Circle API
+    // Use the correct endpoint for contract execution per documentation
+    // https://developers.circle.com/api-reference/w3s/developer-controlled-wallets/create-contract-execution-transaction
+    const usedEndpoint = `https://api.circle.com/v1/w3s/developer/transactions/contractExecution`;
+    
+    console.log('Sending contract execution request to Circle API:', {
+      endpoint: usedEndpoint,
+      walletId: transactionData.walletId,
+      walletAddress: walletAddress,
+      contractAddress: transactionData.contractAddress,
+      abiFunctionSignature: transactionData.abiFunctionSignature,
+      abiParameters: transactionData.abiParameters,
+      feeLevel: transactionData.feeLevel,
+      entitySecretCiphertext: transactionData.entitySecretCiphertext ? `${transactionData.entitySecretCiphertext.substring(0, 20)}...` : 'MISSING',
+      blockchain: blockchain,
+      walletVerifiedInCircle: walletVerifiedInCircle,
+      walletStateInDB: wallet.state,
+      note: walletVerifiedInCircle 
+        ? 'Wallet verified in Circle - proceeding with transaction'
+        : 'Wallet not verified in Circle (may belong to different entity) - attempting transaction anyway'
+    });
+    
+    const response = await fetch(usedEndpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${circleApiKey}`,
+        'Content-Type': 'application/json',
+        'X-Entity-Secret-Ciphertext': entitySecretCiphertextForRequest
+      },
+      body: JSON.stringify(transactionData)
+    });
+
+    console.log('Circle API response status:', response.status, 'Endpoint used:', usedEndpoint);
+
+    if (!response.ok) {
+      let errorText: string;
+      let errorJson: any = null;
+      
+      try {
+        errorText = await response.text();
+        // Попытка распарсить как JSON
+        try {
+          errorJson = JSON.parse(errorText);
+        } catch {
+          // Если не JSON, оставляем как текст
+        }
+      } catch (e) {
+        errorText = `Failed to read error response: ${e}`;
+      }
+
+      const errorDetails = {
+        status: response.status,
+        statusText: response.statusText,
+        error: errorText,
+        errorJson: errorJson,
+        endpoint: usedEndpoint,
+        requestData: {
+          walletId: transactionData.walletId,
+          contractAddress: transactionData.contractAddress,
+          abiFunctionSignature: transactionData.abiFunctionSignature,
+          abiParameters: transactionData.abiParameters,
+          feeLevel: transactionData.feeLevel
+        }
+      };
+
+      console.error('Circle API error response:', errorDetails);
+
+      // Special handling for a 404 error
+      if (response.status === 404) {
+        return c.json({
+          error: 'Resource not found',
+          details: errorJson?.message || errorText || 'The requested resource was not found',
+          possibleCauses: [
+            'Wallet ID does not exist in Circle',
+            'Wallet ID does not belong to your entity',
+            'Contract address is invalid',
+            'Incorrect API endpoint or method'
+          ],
+          errorResponse: errorJson || errorText,
+          requestData: {
+            walletId: transactionData.walletId,
+            contractAddress: transactionData.contractAddress
+          }
+        }, 404);
+      }
+
+      return c.json({
+        error: 'Circle API error',
+        status: response.status,
+        details: errorJson?.message || errorText || 'Unknown error',
+        errorResponse: errorJson || errorText
+      }, response.status);
+    }
+
+    const result = await response.json();
+    console.log('Circle API transaction response:', JSON.stringify(result, null, 2));
+    
+    // Circle API returns a transaction id and state; txHash may be located elsewhere
+    const transactionId: string | undefined = result.data?.id;
+    const transactionState: string | undefined = result.data?.state;
+    const txHash: string | undefined = result.data?.transaction?.hash || result.data?.hash;
+
+    if (!transactionId) {
+      console.error('No transaction ID in response:', result);
+      throw new Error('Failed to get transaction ID from Circle API');
+    }
+
+    // If txHash is not present yet (state INITIATED or QUEUED), that's expected.
+    // The client should poll for transaction status later.
+    if (!txHash && transactionState !== 'INITIATED' && transactionState !== 'QUEUED') {
+      console.warn('Transaction created but no hash yet. State:', transactionState);
+    }
+
+    return c.json({
+      success: true,
+      txHash: txHash || undefined,
+      transactionId: transactionId,
+      transactionState: transactionState,
+      transaction: result.data
+    });
+  } catch (error) {
+    console.error('Error sending transaction:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ 
+      error: 'Failed to send transaction',
+      details: errorMessage
+    }, 500);
+  }
+});
+
+// Get transaction status by transactionId
+app.get('/wallets/transaction-status', async (c) => {
+  try {
+    const transactionId = c.req.query('transactionId');
+    
+    if (!transactionId) {
+      return c.json({ error: 'Missing transactionId parameter' }, 400);
+    }
+
+    const circleApiKey = Deno.env.get('CIRCLE_API_KEY');
+    if (!circleApiKey) {
+      return c.json({ error: 'Circle API key not configured' }, 500);
+    }
+
+    // Obtain the entity secret ciphertext
+    let entitySecretCiphertextForRequest: string;
+    const circleEntitySecretCiphertext = Deno.env.get('CIRCLE_ENTITY_SECRET_CIPHERTEXT');
+    const circleEntitySecret = Deno.env.get('CIRCLE_ENTITY_SECRET');
+
+    if (circleEntitySecretCiphertext) {
+      entitySecretCiphertextForRequest = circleEntitySecretCiphertext;
+    } else if (circleEntitySecret) {
+      // If only the entity secret is available, we would need to fetch the public key and encrypt it.
+      // For simplicity, require ciphertext here if available.
+      return c.json({ error: 'Entity secret ciphertext required' }, 500);
+    } else {
+      return c.json({ error: 'Circle Entity Secret or Ciphertext required' }, 500);
+    }
+
+    // Try the common status endpoint (often responds right after INITIATED)
+    const commonUrl = `https://api.circle.com/v1/w3s/transactions/${transactionId}`;
+    const developerUrl = `https://api.circle.com/v1/w3s/developer/transactions/${transactionId}`;
+
+    const baseHeaders: Record<string, string> = {
+      'Authorization': `Bearer ${circleApiKey}`,
+      'Content-Type': 'application/json'
+    };
+    const developerHeaders = {
+      ...baseHeaders,
+      'X-Entity-Secret-Ciphertext': entitySecretCiphertextForRequest
+    };
+
+    // 1) Try without /developer
+    let response = await fetch(commonUrl, { method: 'GET', headers: baseHeaders });
+
+    // 2) If it fails (e.g., 404/401), try /developer (for developer-controlled wallets)
+    if (!response.ok) {
+      response = await fetch(developerUrl, { method: 'GET', headers: developerHeaders });
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return c.json({
+        error: 'Failed to get transaction status',
+        details: errorText,
+      }, response.status);
+    }
+
+    const result = await response.json();
+    const transactionData = result.data?.transaction || result.data;
+
+    const txHash =
+      transactionData?.hash ||
+      transactionData?.txHash ||
+      transactionData?.transactionHash;
+    const transactionState = transactionData?.state || result.data?.state;
+
+    return c.json({
+      success: true,
+      txHash: txHash || undefined,
+      transactionId,
+      transactionState,
+      transaction: transactionData
+    });
+  } catch (error) {
+    console.error('Error getting transaction status:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ 
+      error: 'Failed to get transaction status',
+      details: errorMessage
     }, 500);
   }
 });

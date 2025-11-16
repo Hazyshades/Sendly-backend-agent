@@ -52,3 +52,18 @@ COMMENT ON COLUMN telegram_contacts.telegram_user_id IS 'Telegram user ID for th
 COMMENT ON COLUMN telegram_contacts.display_name IS 'Convenience display name built from first/last name or username';
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
