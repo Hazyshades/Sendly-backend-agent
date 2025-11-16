@@ -164,6 +164,60 @@ function getPrivyCredentials(): PrivyCredentials | null {
   return { appId, secret };
 }
 
+// Helper: Re-encrypt Circle Entity Secret into fresh ciphertext (required per POST request)
+// Uses RSA-OAEP with SHA-256 and the entity public key returned by Circle.
+async function reEncryptEntitySecretCiphertextGlobal(circleApiKey: string, circleEntitySecret: string): Promise<string> {
+  // Fetch entity public key
+  const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${circleApiKey}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  if (!publicKeyResponse.ok) {
+    const errorText = await publicKeyResponse.text();
+    throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
+  }
+  const publicKeyData = await publicKeyResponse.json();
+  const entityPublicKey = publicKeyData.data?.publicKey;
+  if (!entityPublicKey) {
+    throw new Error('Failed to get entity public key from response');
+  }
+
+  // Convert hex secret to bytes
+  const entitySecretBytes = new Uint8Array(
+    circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+  );
+
+  // Clean PEM/base64 wrappers and decode to DER (SPKI)
+  const keyWithoutHeaders = entityPublicKey
+    .replace(/-----BEGIN PUBLIC KEY-----/g, '')
+    .replace(/-----END PUBLIC KEY-----/g, '')
+    .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
+    .replace(/-----END RSA PUBLIC KEY-----/g, '')
+    .replace(/\s/g, '')
+    .replace(/\n/g, '')
+    .replace(/\r/g, '');
+  let publicKeyBuffer: Uint8Array;
+  try {
+    publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
+  } catch (e) {
+    throw new Error(`Failed to decode public key as base64. Error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Import public key and encrypt
+  const publicKey = await crypto.subtle.importKey(
+    'spki',
+    publicKeyBuffer,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    false,
+    ['encrypt']
+  );
+  const encrypted = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, entitySecretBytes);
+  return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
+}
+
 async function fetchPrivyUserById(userId: string) {
   const credentials = getPrivyCredentials();
 
@@ -1027,12 +1081,12 @@ app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
     let useCircleAPI = false;
     let devWallet: any = null;
 
-    // Определить адрес для claim
+    //Def address for claim
     if (useDeveloperWallet || !walletAddress) {
-      // Использовать Developer wallet
+      // Use Developer wallet
       const client = getSupabaseClient();
       
-      // Найти или создать Developer wallet
+      // Find or create Developer wallet
       let { data: existingWallet } = await client
         .from('developer_wallets')
         .select('*')
@@ -1042,7 +1096,7 @@ app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
         .single();
 
       if (!existingWallet && privyUserId && socialUserId) {
-        // Создать Developer wallet автоматически
+        // Create Developer wallet automatically
         const SUPABASE_FUNCTION_URL = Deno.env.get('SUPABASE_FUNCTION_URL') || 
           `${Deno.env.get('SUPABASE_URL')}/functions/v1/server`;
         
@@ -1078,14 +1132,14 @@ app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
       targetWalletAddress = existingWallet.wallet_address;
       useCircleAPI = true;
     } else {
-      // Использовать MetaMask кошелек
+      // Use  MetaMask wallet
       targetWalletAddress = walletAddress;
       useCircleAPI = false;
     }
 
     // Claim the card
     if (useCircleAPI && devWallet) {
-      // Использовать Circle API для отправки транзакции
+      // use Circle API to send transaction
       const TWITCH_VAULT_CONTRACT_ADDRESS = Deno.env.get('VITE_ARC_TWITCH_VAULT_ADDRESS') || 
         '0xA27E6Cef4e9d794EE0356461fe65437Bb5f7cbE3';
       
@@ -1113,7 +1167,7 @@ app.post('/gift-cards/twitch/:tokenId/claim', async (c) => {
         throw new Error(txResult.error || 'Failed to send transaction');
       }
 
-      // Обновить mapping
+      // refresh mapping data
       mapping.status = 'claimed';
       mapping.realOwner = targetWalletAddress;
       mapping.claimedAt = new Date().toISOString();
@@ -3064,87 +3118,7 @@ app.post('/wallets/create', async (c) => {
       }, 500);
     }
 
-    // Helper function to re-encrypt entity secret ciphertext
-    // Note: Circle requires a new ciphertext for each POST request
-    async function reEncryptEntitySecretCiphertext(): Promise<string> {
-      if (!circleEntitySecret) {
-        throw new Error('CIRCLE_ENTITY_SECRET is required for re-encryption');
-      }
-      
-      // Get entity public key
-      const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${circleApiKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (!publicKeyResponse.ok) {
-        const errorText = await publicKeyResponse.text();
-        throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
-      }
-      
-      const publicKeyData = await publicKeyResponse.json();
-      const entityPublicKey = publicKeyData.data?.publicKey;
-      
-      if (!entityPublicKey) {
-        throw new Error('Failed to get entity public key from response');
-      }
-      
-      // Convert entity secret from hex to bytes
-      const entitySecretBytes = new Uint8Array(
-        circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
-      );
-      
-      // Process public key - it might be in PEM format or base64
-      let publicKeyBuffer: Uint8Array;
-      
-      // Remove PEM headers if present and clean whitespace
-      const keyWithoutHeaders = entityPublicKey
-        .replace(/-----BEGIN PUBLIC KEY-----/g, '')
-        .replace(/-----END PUBLIC KEY-----/g, '')
-        .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
-        .replace(/-----END RSA PUBLIC KEY-----/g, '')
-        .replace(/\s/g, '')
-        .replace(/\n/g, '')
-        .replace(/\r/g, '');
-      
-      try {
-        // Try to decode as base64
-        publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
-      } catch (e) {
-        // If base64 decoding fails, the key might already be in a different format
-        // Log the error for debugging
-        console.error('Failed to decode public key as base64:', e);
-        console.error('Public key format (first 100 chars):', entityPublicKey.substring(0, 100));
-        throw new Error(`Failed to decode public key as base64. Key format might be unsupported. Error: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      
-      // Import the public key for encryption
-      const publicKey = await crypto.subtle.importKey(
-        'spki',
-        publicKeyBuffer,
-        {
-          name: 'RSA-OAEP',
-          hash: 'SHA-256',
-        },
-        false,
-        ['encrypt']
-      );
-      
-      // Encrypt the entity secret
-      const encrypted = await crypto.subtle.encrypt(
-        {
-          name: 'RSA-OAEP',
-        },
-        publicKey,
-        entitySecretBytes
-      );
-      
-      // Convert to base64
-      return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
-    }
+    // Helper function moved to top-level: reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret)
 
     // Create or get wallet set
     let walletSetId = circleWalletSetId;
@@ -3159,7 +3133,7 @@ app.post('/wallets/create', async (c) => {
       if (circleEntitySecretCiphertext && circleEntitySecret) {
         try {
           // Try to re-encrypt the entity secret for this request
-          entitySecretCiphertextForRequest = await reEncryptEntitySecretCiphertext();
+          entitySecretCiphertextForRequest = await reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret);
         } catch (reEncryptError) {
           console.warn('Failed to re-encrypt entity secret, using existing ciphertext:', reEncryptError);
           // Fallback to existing ciphertext (may fail if reused)
@@ -3209,7 +3183,7 @@ app.post('/wallets/create', async (c) => {
     if (circleEntitySecret) {
       try {
         // Try to re-encrypt the entity secret for this request
-        entitySecretCiphertextForWallet = await reEncryptEntitySecretCiphertext();
+        entitySecretCiphertextForWallet = await reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret);
       } catch (reEncryptError) {
         console.warn('Failed to re-encrypt entity secret for wallet creation:', reEncryptError);
         // Fallback to existing ciphertext if available
@@ -4047,68 +4021,7 @@ app.post('/wallets/create-for-social', async (c) => {
       }, 500);
     }
 
-    // Helper function to re-encrypt entity secret ciphertext
-    async function reEncryptEntitySecretCiphertext(): Promise<string> {
-      if (!circleEntitySecret) {
-        throw new Error('CIRCLE_ENTITY_SECRET is required for re-encryption');
-      }
-      
-      const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${circleApiKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (!publicKeyResponse.ok) {
-        const errorText = await publicKeyResponse.text();
-        throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
-      }
-      
-      const publicKeyData = await publicKeyResponse.json();
-      const entityPublicKey = publicKeyData.data?.publicKey;
-      
-      if (!entityPublicKey) {
-        throw new Error('Failed to get entity public key from response');
-      }
-      
-      const entitySecretBytes = new Uint8Array(
-        circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
-      );
-      
-      const keyWithoutHeaders = entityPublicKey
-        .replace(/-----BEGIN PUBLIC KEY-----/g, '')
-        .replace(/-----END PUBLIC KEY-----/g, '')
-        .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
-        .replace(/-----END RSA PUBLIC KEY-----/g, '')
-        .replace(/\s/g, '')
-        .replace(/\n/g, '')
-        .replace(/\r/g, '');
-      
-      const publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
-      
-      const publicKey = await crypto.subtle.importKey(
-        'spki',
-        publicKeyBuffer,
-        {
-          name: 'RSA-OAEP',
-          hash: 'SHA-256',
-        },
-        false,
-        ['encrypt']
-      );
-      
-      const encrypted = await crypto.subtle.encrypt(
-        {
-          name: 'RSA-OAEP',
-        },
-        publicKey,
-        entitySecretBytes
-      );
-      
-      return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
-    }
+    // Helper function moved to top-level: reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret)
 
     // Ensure CIRCLE_ENTITY_SECRET is present (required for re-encryption)
     if (!circleEntitySecret) {
@@ -4127,7 +4040,7 @@ app.post('/wallets/create-for-social', async (c) => {
       // Re-encrypt for wallet set creation
       let entitySecretCiphertextForWalletSet: string;
       try {
-        entitySecretCiphertextForWalletSet = await reEncryptEntitySecretCiphertext();
+        entitySecretCiphertextForWalletSet = await reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret);
         console.log('Successfully re-encrypted entity secret ciphertext for wallet set');
       } catch (reEncryptError) {
         console.error('Failed to re-encrypt entity secret for wallet set:', reEncryptError);
@@ -4169,7 +4082,7 @@ app.post('/wallets/create-for-social', async (c) => {
     // Re-encrypt for wallet creation (fresh ciphertext required for every request)
     let entitySecretCiphertextForWalletCreation: string;
     try {
-      entitySecretCiphertextForWalletCreation = await reEncryptEntitySecretCiphertext();
+      entitySecretCiphertextForWalletCreation = await reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret);
       console.log('Successfully re-encrypted entity secret ciphertext for wallet creation');
     } catch (reEncryptError) {
       console.error('Failed to re-encrypt entity secret for wallet creation:', reEncryptError);
@@ -4381,75 +4294,14 @@ app.post('/wallets/send-transaction', async (c) => {
       blockchain: blockchain
     });
 
-    // Helper function to re-encrypt entity secret ciphertext
-    async function reEncryptEntitySecretCiphertext(): Promise<string> {
-      if (!circleEntitySecret) {
-        throw new Error('CIRCLE_ENTITY_SECRET is required for re-encryption');
-      }
-      
-      const publicKeyResponse = await fetch('https://api.circle.com/v1/w3s/config/entity/publicKey', {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${circleApiKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (!publicKeyResponse.ok) {
-        const errorText = await publicKeyResponse.text();
-        throw new Error(`Failed to get public key: ${publicKeyResponse.status} ${errorText}`);
-      }
-      
-      const publicKeyData = await publicKeyResponse.json();
-      const entityPublicKey = publicKeyData.data?.publicKey;
-      
-      if (!entityPublicKey) {
-        throw new Error('Failed to get entity public key from response');
-      }
-      
-      const entitySecretBytes = new Uint8Array(
-        circleEntitySecret.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
-      );
-      
-      const keyWithoutHeaders = entityPublicKey
-        .replace(/-----BEGIN PUBLIC KEY-----/g, '')
-        .replace(/-----END PUBLIC KEY-----/g, '')
-        .replace(/-----BEGIN RSA PUBLIC KEY-----/g, '')
-        .replace(/-----END RSA PUBLIC KEY-----/g, '')
-        .replace(/\s/g, '')
-        .replace(/\n/g, '')
-        .replace(/\r/g, '');
-      
-      const publicKeyBuffer = Uint8Array.from(atob(keyWithoutHeaders), c => c.charCodeAt(0));
-      
-      const publicKey = await crypto.subtle.importKey(
-        'spki',
-        publicKeyBuffer,
-        {
-          name: 'RSA-OAEP',
-          hash: 'SHA-256',
-        },
-        false,
-        ['encrypt']
-      );
-      
-      const encrypted = await crypto.subtle.encrypt(
-        {
-          name: 'RSA-OAEP',
-        },
-        publicKey,
-        entitySecretBytes
-      );
-      
-      return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
-    }
+    // Helper function moved to top-level: reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret)
 
     // Re-encrypt Entity Secret Ciphertext
     let entitySecretCiphertextForRequest: string;
     
     if (circleEntitySecret) {
       try {
-        entitySecretCiphertextForRequest = await reEncryptEntitySecretCiphertext();
+        entitySecretCiphertextForRequest = await reEncryptEntitySecretCiphertextGlobal(circleApiKey, circleEntitySecret);
       } catch (reEncryptError) {
         console.warn('Failed to re-encrypt entity secret:', reEncryptError);
         if (circleEntitySecretCiphertext) {
@@ -4470,7 +4322,7 @@ app.post('/wallets/send-transaction', async (c) => {
       }, 500);
     }
 
-    // Проверка, что entitySecretCiphertextForRequest не пустой
+    // Check, that entitySecretCiphertextForRequest is not empty
     if (!entitySecretCiphertextForRequest || entitySecretCiphertextForRequest.trim() === '') {
       return c.json({ 
         error: 'Entity Secret Ciphertext is empty',
@@ -4496,7 +4348,7 @@ app.post('/wallets/send-transaction', async (c) => {
       Deno.env.get('VITE_ARC_CONTRACT_ADDRESS'),
       Deno.env.get('VITE_CONTRACT_ADDRESS'),
       '0x5743fd9c6372bE37B2CE8884EA9e8bF291132677', // Current address from logs
-      '0x7f5c9e8548002134cde6093f2ca3ff5b8bd26982' // Fallback адрес
+      '0x7f5c9e8548002134cde6093f2ca3ff5b8bd26982' // Fallback address
     ].filter((addr): addr is string => Boolean(addr)).map(addr => addr.toLowerCase());
     const isMainContract = mainContractAddresses.some(addr => contractAddressLower === addr);
     
@@ -4658,11 +4510,11 @@ app.post('/wallets/send-transaction', async (c) => {
       
       try {
         errorText = await response.text();
-        // Попытка распарсить как JSON
+        // Try parse json
         try {
           errorJson = JSON.parse(errorText);
         } catch {
-          // Если не JSON, оставляем как текст
+          // If not JSON, leave as text
         }
       } catch (e) {
         errorText = `Failed to read error response: ${e}`;
